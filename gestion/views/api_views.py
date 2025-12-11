@@ -3,6 +3,7 @@
 from django.http import JsonResponse
 from django.contrib.auth.decorators import login_required
 from django.db.models import Q, Sum
+from django.db.models.functions import Coalesce
 from django.db import transaction
 from django.views.decorators.http import require_http_methods
 from decimal import Decimal
@@ -10,6 +11,7 @@ import json
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status
 from ..models import Inventory, Zone, Product, Sale, SaleItem, Client, SupplierOrder, SupplierOrderItem, ProductSupplier
 
 @login_required
@@ -39,6 +41,52 @@ def get_product_stock_info(request, product_id):
         return JsonResponse({'status': 'error', 'message': 'Producto no encontrado'}, status=404)
 
 @login_required
+def get_product_warehouses_and_zones(request, product_id):
+    """
+    Devuelve las bodegas y zonas donde existe un producto específico (con stock > 0).
+    Agrupado por bodega para facilitar la selección en devoluciones.
+    """
+    try:
+        # Buscar inventario del producto con stock > 0
+        stock_items = Inventory.objects.filter(
+            product_id=product_id,
+            quantity__gt=0
+        ).select_related('zone', 'zone__warehouse')
+        
+        # Agrupar por bodega
+        warehouses_dict = {}
+        for item in stock_items:
+            warehouse_id = item.zone.warehouse.id
+            warehouse_name = item.zone.warehouse.name
+            
+            if warehouse_id not in warehouses_dict:
+                warehouses_dict[warehouse_id] = {
+                    'id': warehouse_id,
+                    'name': warehouse_name,
+                    'zones': []
+                }
+            
+            warehouses_dict[warehouse_id]['zones'].append({
+                'id': item.zone.id,
+                'name': item.zone.name,
+                'stock': item.quantity
+            })
+        
+        # Convertir a lista
+        warehouses_list = list(warehouses_dict.values())
+        
+        return JsonResponse({
+            'status': 'success',
+            'warehouses': warehouses_list
+        })
+    
+    except Exception as e:
+        return JsonResponse({
+            'status': 'error',
+            'message': str(e)
+        }, status=500)
+
+@login_required
 def get_all_zones(request):
     """
     Devuelve TODAS las zonas (para el dropdown de destino).
@@ -51,7 +99,8 @@ def get_all_zones(request):
     return JsonResponse({'status': 'success', 'zones': all_zones_list})
 
 
-@login_required
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
 def get_zones_by_warehouse(request, warehouse_id):
     """
     Devuelve las zonas de una bodega específica.
@@ -59,12 +108,12 @@ def get_zones_by_warehouse(request, warehouse_id):
     try:
         zones = Zone.objects.filter(warehouse_id=warehouse_id, is_active=True).select_related('warehouse')
         zones_list = [
-            {'id': zone.id, 'name': str(zone)}
+            {'id': zone.id, 'name': zone.name}
             for zone in zones
         ]
-        return JsonResponse({'status': 'success', 'zones': zones_list})
+        return Response({'status': 'success', 'zones': zones_list})
     except Exception as e:
-        return JsonResponse({'status': 'error', 'message': str(e)}, status=500)
+        return Response({'status': 'error', 'message': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 # --- HELPER FUNCTION: Obtener zona de ventas ---
@@ -94,41 +143,25 @@ def get_sales_zone():
 def search_products_for_sale(request):
     """
     Busca productos por nombre o SKU y devuelve su precio y 
-    el stock DISPONIBLE en la ZONA DE VENTAS.
+    el stock TOTAL disponible (suma de todas las zonas).
     """
     query = request.query_params.get('q', '') or request.query_params.get('query', '')
     if len(query) < 2: # No buscar con menos de 2 caracteres
         return Response({'status': 'success', 'products': []})
 
     try:
-        # 1. Buscamos productos que coincidan
+        # 1. Buscamos productos que coincidan con prefetch de inventario para optimizar
         products = Product.objects.filter(
             Q(name__icontains=query) | Q(sku__icontains=query),
             is_active=True
-        )[:10] # Limitamos a 10 resultados
+        ).prefetch_related('stock')[:10] # Limitamos a 10 resultados
 
-        # 2. Obtenemos la zona de ventas (o usar stock total si no hay zona específica)
-        sales_zone = get_sales_zone()
-        
         results = []
         for product in products:
-            # 3. Buscamos el stock disponible
-            if sales_zone:
-                # Si hay zona de ventas, buscar stock en esa zona
-                try:
-                    stock_item = Inventory.objects.get(product=product, zone=sales_zone)
-                    available_stock = stock_item.quantity
-                except Inventory.DoesNotExist:
-                    available_stock = 0
-            else:
-                # Si no hay zona de ventas configurada, usar stock total
-                total_stock = Inventory.objects.filter(product=product).aggregate(
-                    total=Sum('quantity')
-                )['total'] or 0
-                available_stock = int(total_stock)
-            
-            # IMPORTANTE: Solo mostrar productos con stock disponible
-            # (comentado para mostrar todos, pero el frontend puede filtrar)
+            # 2. Calcular stock total sumando todas las zonas (igual que en movimientos)
+            # Usar el prefetch para evitar consultas adicionales
+            total_stock = sum(item.quantity for item in product.stock.all())
+            available_stock = int(total_stock)
 
             # Convertir precio a número (float) para que funcione correctamente en el frontend
             precio_venta = float(product.precio_venta or 0)
@@ -151,8 +184,8 @@ def search_products_for_sale(request):
 @permission_classes([IsAuthenticated])
 def get_all_products_for_sale(request):
     """
-    Devuelve todos los productos activos con su precio y stock disponible
-    en la zona de ventas (o stock total si no hay zona específica).
+    Devuelve todos los productos activos con su precio y stock TOTAL disponible
+    (suma de todas las zonas, igual que en el módulo de movimientos).
     """
     try:
         # Obtener parámetros de paginación
@@ -160,27 +193,16 @@ def get_all_products_for_sale(request):
         page_size = int(request.query_params.get('page_size', 50))
         offset = (page - 1) * page_size
         
-        # Obtener todos los productos activos
-        products = Product.objects.filter(is_active=True).order_by('name')[offset:offset + page_size]
+        # Obtener todos los productos activos con prefetch de inventario para optimizar
+        products = Product.objects.filter(is_active=True).prefetch_related('stock').order_by('name')[offset:offset + page_size]
         total = Product.objects.filter(is_active=True).count()
-        
-        # Obtener la zona de ventas
-        sales_zone = get_sales_zone()
         
         results = []
         for product in products:
-            # Buscar el stock disponible
-            if sales_zone:
-                try:
-                    stock_item = Inventory.objects.get(product=product, zone=sales_zone)
-                    available_stock = stock_item.quantity
-                except Inventory.DoesNotExist:
-                    available_stock = 0
-            else:
-                total_stock = Inventory.objects.filter(product=product).aggregate(
-                    total=Sum('quantity')
-                )['total'] or 0
-                available_stock = int(total_stock)
+            # Calcular stock total sumando todas las zonas (igual que en movimientos)
+            # Usar el prefetch para evitar consultas adicionales
+            total_stock = sum(item.quantity for item in product.stock.all())
+            available_stock = int(total_stock)
             
             precio_venta = float(product.precio_venta or 0)
             
